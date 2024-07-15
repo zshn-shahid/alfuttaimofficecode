@@ -1,0 +1,124 @@
+import win32com.client
+import re
+import pandas as pd
+from datetime import datetime
+import os
+
+def process_folder(folder, sent_folder, patterns, resolution_phrases, processed_orders):
+    data_list = []
+    
+    for message in folder.Items:
+        if message.Class == 43:  # 43 refers to the mail item
+            subject = message.Subject
+            order_number_match = re.search(r"Order Number: (\d+)", subject)
+            if not order_number_match:
+                continue  # Skip emails without order number in the subject
+
+            order_number = order_number_match.group(1)
+            if order_number in processed_orders:
+                continue  # Skip already processed emails
+
+            body = message.Body
+            email_data = {}
+            for key, pattern in patterns.items():
+                match = pattern.search(body)
+                if match:
+                    email_data[key] = match.group(1).strip()
+            if email_data:
+                email_data["Received Time"] = message.ReceivedTime
+                email_data["Order Number"] = order_number
+                # Search for the resolution email in the sent items
+                related_messages = [msg for msg in sent_folder.Items if order_number in msg.Subject]
+                for response in related_messages:
+                    response_body = response.Body
+                    if any(phrase in response_body for phrase in resolution_phrases):
+                        email_data["Resolved Time"] = response.ReceivedTime
+                        break
+                else:
+                    email_data["Resolved Time"] = None  # If no response found
+                data_list.append(email_data)
+    return data_list
+
+def load_processed_orders(log_file):
+    if os.path.exists(log_file):
+        return pd.read_csv(log_file)["Order Number"].tolist()
+    else:
+        return []
+
+def save_processed_orders(log_file, processed_orders):
+    df = pd.DataFrame(processed_orders, columns=["Order Number"])
+    df.to_csv(log_file, index=False)
+
+# Initialize Outlook application
+outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+# Specify the email account you want to access
+account_name = "specific_account@example.com"
+account = None
+for acc in outlook.Folders:
+    if acc.Name == account_name:
+        account = acc
+        break
+
+if account is None:
+    print(f"Account with the name {account_name} not found.")
+else:
+    # Access the sent items folder
+    sent_folder = account.Folders["Sent Items"]
+
+    # Define regex patterns for the details
+    patterns = {
+        "Requestor": re.compile(r"Requestor:\s*(.*)"),
+        "Type of Request": re.compile(r"Type of Request:\s*(.*)"),
+        "Subtype": re.compile(r"Subtype:\s*(.*)"),
+        "Order Number": re.compile(r"Order Number:\s*(.*)"),
+        "Parts Value": re.compile(r"Parts Value:\s*(.*)"),
+        "Labor Value": re.compile(r"Labor Value:\s*(.*)"),
+        "Approver Email": re.compile(r"Approver Email:\s*(.*)"),
+        "Date of request": re.compile(r"Date of request:\s*(.*)"),
+    }
+
+    # Define phrases for resolution
+    resolution_phrases = ["Price has been updated", "Discount has been applied"]
+
+    # List of folders to process
+    folder_names = ["Discount Requests", "Another Folder"]  # Add more folder names as needed
+
+    # Load processed order numbers
+    log_file = 'processed_orders_log.csv'
+    processed_orders = load_processed_orders(log_file)
+    new_processed_orders = []
+
+    all_data = []
+
+    for folder_name in folder_names:
+        folder = account.Folders["Inbox"].Folders[folder_name]
+        folder_data = process_folder(folder, sent_folder, patterns, resolution_phrases, processed_orders)
+        all_data.extend(folder_data)
+        new_processed_orders.extend([item["Order Number"] for item in folder_data])
+
+    # Save processed order numbers
+    processed_orders.extend(new_processed_orders)
+    save_processed_orders(log_file, processed_orders)
+
+    # Convert the data list to a pandas DataFrame
+    df = pd.DataFrame(all_data)
+
+    # Ensure columns are correctly ordered and present
+    columns = ["Requestor", "Type of Request", "Subtype", "Order Number", "Parts Value", "Labor Value", "Approver Email", "Date of request", "Received Time", "Resolved Time"]
+    for col in columns:
+        if col not in df.columns:
+            df[col] = None  # Add missing columns
+
+    df = df[columns]
+
+    # Load existing data from Excel file if it exists
+    output_file = 'email_requests.xlsx'
+    if os.path.exists(output_file):
+        existing_df = pd.read_excel(output_file)
+        df = pd.concat([existing_df, df], ignore_index=True)
+
+    # Save updated data to Excel file
+    df.to_excel(output_file, index=False)
+
+    print(f"Data has been saved to {output_file}")
